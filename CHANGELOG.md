@@ -5,6 +5,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### 2026-07-24 - Reusable one-command deploy + Claude environment replication
+
+**Added**
+- `deploy.sh`: one command (`./deploy.sh user@host [domain]`) that bundles this machine's `~/.claude`, ships it over SSH, runs autoconfig, and replicates the full Claude Code setup into the container. Secrets travel over scp and are wiped from the VM afterward; nothing personal enters the repo.
+- `deploy/replicate-claude-env.sh`: idempotent in-container setup. Places CLAUDE.md, RTK.md, reference/, skills/, settings.json and the credential; adds the dmj (GitHub), caveman, and official plugin marketplaces and installs every enabled plugin; installs the `anthropic.claude-code` VS Code extension. Rewrites the dmj marketplace source from the laptop path to GitHub and drops laptop-only hooks.
+- Dynamic port handling: integrate mode never binds a host port (the container is reached by name), and standalone mode walks to the first free host port, so a busy VM needs no manual port config.
+
 ### 2026-07-24 - Pivot: GCP to OCI, container-integrate behind an existing Caddy
 
 **Changed**

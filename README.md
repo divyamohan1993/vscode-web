@@ -4,6 +4,14 @@ Close the laptop. The agents keep coding. vscode-web puts full VS Code in your b
 
 Live now at https://vscode.dmj.one (code-server answers with its login redirect, HTTP 302, through the existing Caddy front door).
 
+## One command
+
+From the machine whose `~/.claude` is your daily setup:
+```bash
+./deploy.sh user@your-vm vscode.example.com
+```
+That is the whole instruction. `deploy.sh` bundles your `~/.claude` (config plus credential), ships it over SSH, runs `autoconfig.sh` to stand up code-server behind whatever already fronts the VM (auto-detecting the front door, the docker network, and a free port), then replicates your entire Claude Code environment inside the container. No ports to negotiate, nothing to wire by hand. Finish by adding the one Cloudflare DNS record it prints.
+
 ## Why
 
 Long agent runs need a machine that stays on. Your laptop does not, and you should not have to babysit it. A small always-on VM survives every lid close, reboot, and commute. On OCI's Always-Free tier it costs nothing.
@@ -59,6 +67,17 @@ Verified across deploys: sso.dmj.one, workday.dmj.one, and testudaan.dmj.one wer
 ## Persistence
 
 A named docker volume, `vscode-web-home`, holds `/home/coder`: your workspace, installed extensions, editor config, and the `claude` login. Restart or rebuild the container and all of it is still there.
+
+## What lands on the server
+
+`deploy/replicate-claude-env.sh` makes the server's Claude Code identical to your laptop, so you can close the lid and keep working from the browser:
+
+- Your `CLAUDE.md`, `RTK.md`, `reference/`, `skills/`, and `settings.json`.
+- Your credential, so `claude` is already logged in (real inference, your plan).
+- Every plugin you run: the `dmj` marketplace (31 skills) cloned from GitHub, `caveman`, and the official plugins.
+- The `anthropic.claude-code` VS Code extension, installed into code-server.
+
+Personal config and the credential travel over SSH only. They never enter this repo: `.env` is gitignored, and the bundle is a runtime transfer that `deploy.sh` deletes from the VM when it is done.
 
 ## Cost
 
@@ -123,14 +142,18 @@ Swap the model id for GLM, Nemotron, Kimi K2, DeepSeek, or anything else in the 
 ## Files
 
 ```
+deploy.sh                 # one command: bundle ~/.claude, deploy, replicate. Run on your laptop.
 deploy/
-  autoconfig.sh   # the only deploy artifact. Detects the Caddy front door and
-                  # integrates one site block (build image, run container on the
-                  # front-door network, validate, graceful reload, auto-rollback),
-                  # or falls back to standalone. Idempotent, safe to rerun.
-.env.example      # all config; copy to .env on the VM
-.gitignore
-idea.md           # the original problem statement
+  autoconfig.sh           # stands up code-server. Detects the front door and
+                          # integrates one Caddy site block (build image, run
+                          # container on the front-door network, validate,
+                          # graceful reload, auto-rollback), or falls back to
+                          # standalone on a free host port. Idempotent.
+  replicate-claude-env.sh # runs inside the container: config, plugins, key,
+                          # and the VS Code extension. Idempotent.
+.env.example              # all config; copy to .env (gitignored)
+.gitattributes            # keep *.sh LF so scripts run on Linux
+idea.md                   # the original problem statement
 README.md
 CHANGELOG.md
 ```

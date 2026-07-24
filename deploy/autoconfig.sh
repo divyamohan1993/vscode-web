@@ -240,6 +240,16 @@ else
   CODE_SERVER_USER="${CODE_SERVER_USER:-${SUDO_USER:-ubuntu}}"
   NODE_VERSION="${NODE_VERSION:-20}"
   CS_HOME="$(getent passwd "${CODE_SERVER_USER}" | cut -d: -f6)"
+  # Standalone binds a real host port, so it can collide on a busy box. If the
+  # requested port is taken, walk up to the first free one. (Integrate mode does
+  # not need this: the container port never touches the host.)
+  if command -v ss >/dev/null 2>&1; then
+    _start="${CODE_SERVER_PORT}"; _p="${_start}"
+    while ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE ":${_p}\$"; do
+      _p=$((_p + 1)); [[ ${_p} -gt $((_start + 100)) ]] && break
+    done
+    if [[ "${_p}" != "${CODE_SERVER_PORT}" ]]; then echo "  host port ${CODE_SERVER_PORT} busy, using free port ${_p}"; CODE_SERVER_PORT="${_p}"; fi
+  fi
   export DEBIAN_FRONTEND=noninteractive
   echo "[1/4] Installing packages (targeted)..."; apt-get update -qq
   apt-get install -y -qq curl ca-certificates gnupg jq git openssl >/dev/null
