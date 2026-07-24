@@ -1,0 +1,3 @@
+# Deploy scripts must keep LF endings so they run on Linux even when the repo
+# is cloned on Windows (CRLF in a bash script breaks the shebang and heredocs).
+*.sh text eol=lf
