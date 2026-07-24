@@ -1,325 +1,314 @@
 #!/usr/bin/env bash
-# autoconfig.sh — Idempotent bootstrap: blank Ubuntu 22.04 -> code-server on 443
+# autoconfig.sh: Put VS Code (code-server) in the browser on a host, behind
+# whatever already fronts :80/:443, WITHOUT disrupting a single existing site.
 #
-# What it does (all idempotent, safe to rerun):
-#   1. Installs system packages (curl, nginx, ufw, fail2ban, jq, build deps)
-#   2. Installs code-server (VS Code in the browser) via official script
-#   3. Installs Node 20 LTS (for Claude Code agents) via NodeSource
-#   4. Installs Claude Code CLI (npm -g)
-#   5. Generates + hashes a password (Argon2id) if CODE_SERVER_PASSWORD is unset
-#   6. Configures code-server as a systemd service bound to 127.0.0.1:8080
-#   7. Configures Nginx reverse proxy 443 -> 127.0.0.1:8080 with TLS (self-signed
-#      by default; Cloudflare proxy terminates real TLS at the edge)
-#   8. Locks down UFW: 22, 80, 443 only
-#   9. Enables fail2ban for SSH brute-force protection
-#  10. Verifies GET /health responds
+# Two modes, auto-detected:
 #
-# All secrets come from .env (never in source). Rerun rotates nothing unless you
-# change .env. Timestamped logs to /var/log/autoconfig-<ts>.log.
+#   integrate  : a Caddy container already owns :443 (the common self-host / OCI
+#                case). code-server runs as ITS OWN container joined to that
+#                Caddy's docker network, and Caddy reaches it by name, exactly
+#                like the box's other proxied apps. This deliberately does NOT
+#                bind a host port and does NOT touch the host firewall: many
+#                hardened hosts REJECT docker->host traffic except on a
+#                whitelist (seen in the wild as INPUT ... -j REJECT
+#                icmp-host-prohibited), so a host-native upstream would 502.
+#                A container on the same bridge is the only non-invasive path.
+#                We APPEND one site block to the Caddyfile, `caddy validate`,
+#                graceful `caddy reload`, back up first, baseline every existing
+#                site, and AUTO-ROLL-BACK if any healthy site regresses.
 #
-# Usage (on the VM, as a user with sudo):
-#   sudo bash autoconfig.sh
+#   standalone : no front door found (a blank VM). code-server runs host-native
+#                under systemd on 127.0.0.1, and we install Caddy natively to
+#                serve ${DOMAIN}. (Greenfield convenience path; not exercised on
+#                the dmj box.)
 #
-# Required .env vars:
-#   CODE_SERVER_PASSWORD   (plaintext; hashed to Argon2id on first run)
-#   NVIDIA_API_KEY          (optional; for build.nvidia.com models in code-server)
-#   CLAUDE_CODE_OAUTH_TOKEN (optional; for Claude Code CLI auth)
-# Optional:
-#   DOMAIN                  (code.dmj.one — used for Nginx server_name + TLS)
-#   CODE_SERVER_PORT        (default 8080, internal)
-#   NODE_VERSION            (default 20)
+# Never: installs Nginx, runs `apt upgrade`, edits the host firewall, or touches
+# any container/site other than code-server's own. Idempotent: rerun freely.
+#
+# Usage (on the VM):  sudo bash autoconfig.sh
+#
+# .env (loaded from ./, /home/ubuntu, or /root):
+#   CODE_SERVER_PASSWORD    login password (blank -> one is generated + saved once)
+#   DOMAIN                  public hostname (default vscode.dmj.one)
+#   NVIDIA_API_KEY          optional; passed into the code-server environment
+#   CLAUDE_CODE_OAUTH_TOKEN optional; pre-auths the `claude` CLI inside
+#   CODE_SERVER_PORT        code-server's internal port (default 8080)
+#   CONTAINER_NAME          integrate mode container name (default vscode-web)
+#   FRONT_NET               override the docker network to join (default: the
+#                           front-door container's network)
+#   CADDY_CONTAINER         override the front-door container (default: auto)
+#   CADDYFILE_PATH          override the Caddyfile host path (default: the mount)
+#   CODE_SERVER_USER        standalone mode only: user to run as (default: caller)
+#   NODE_VERSION            standalone mode only: Node major (default 20)
 
 set -euo pipefail
 
-# --- Must run as root (sudo) ---
-if [[ $EUID -ne 0 ]]; then
-  echo "ERROR: Run with sudo: sudo bash $0" >&2
-  exit 1
-fi
+if [[ ${EUID} -ne 0 ]]; then echo "ERROR: run with sudo:  sudo bash $0" >&2; exit 1; fi
 
-# --- Load .env ---
-ENV_FILE="${ENV_FILE:-/root/.env}"
-if [[ ! -f "${ENV_FILE}" ]]; then
-  # Try the invoking user's home if running via sudo
-  SUDO_USER_HOME="$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)"
-  [[ -f "${SUDO_USER_HOME}/.env" ]] && ENV_FILE="${SUDO_USER_HOME}/.env"
-fi
-if [[ -f "${ENV_FILE}" ]]; then
-  # shellcheck disable=SC1090
-  set -a; source "${ENV_FILE}"; set +a
-  echo "Loaded env from ${ENV_FILE}"
-else
-  echo "WARNING: No .env found at ${ENV_FILE}. Using defaults / generating password." >&2
-fi
-
-DOMAIN="${DOMAIN:-code.dmj.one}"
-CODE_SERVER_PORT="${CODE_SERVER_PORT:-8080}"
-NODE_VERSION="${NODE_VERSION:-20}"
-CODE_SERVER_USER="${CODE_SERVER_USER:-${SUDO_USER:-root}}"
-CODE_SERVER_HOME="$(getent passwd "${CODE_SERVER_USER}" | cut -d: -f6)"
-CODE_SERVER_HOME="${CODE_SERVER_HOME:-/root}"
-CODE_SERVER_DATA="${CODE_SERVER_DATA:-${CODE_SERVER_HOME}/.local/share/code-server}"
-
-LOG_DIR="/var/log"
 TS="$(date +%Y%m%d-%H%M%S)"
-LOG_FILE="${LOG_DIR}/autoconfig-${TS}.log"
+LOG_FILE="/var/log/vscode-web-autoconfig-${TS}.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
-echo "=== autoconfig.sh run at ${TS} ==="
-echo "Domain: ${DOMAIN} | Internal port: ${CODE_SERVER_PORT} | User: ${CODE_SERVER_USER}"
+echo "=== vscode-web autoconfig @ ${TS} ==="
 
-export DEBIAN_FRONTEND=noninteractive
-
-# --- 1. System packages ---
-echo "[1/10] Installing system packages..."
-apt-get update -qq
-apt-get install -y -qq \
-  curl wget gnupg2 ca-certificates lsb-release \
-  nginx ufw fail2ban jq git build-essential \
-  python3 python3-pip \
-  apt-transport-https software-properties-common \
-  argon2 >/dev/null
-
-# --- 2. code-server ---
-echo "[2/10] Installing code-server..."
-if ! command -v code-server >/dev/null 2>&1; then
-  curl -fsSL https://code-server.dev/install.sh | sh
+# --- load .env ---
+SUDO_HOME="$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)"
+for cand in "./.env" "${SUDO_HOME}/.env" "/home/ubuntu/.env" "/root/.env"; do
+  [[ -f "${cand}" ]] && { ENV_FILE="${cand}"; break; }
+done
+if [[ -n "${ENV_FILE:-}" ]]; then
+  echo "Loading env from ${ENV_FILE}"
+  set -a; # shellcheck disable=SC1090
+  source "${ENV_FILE}"; set +a
 else
-  echo "code-server already installed: $(code-server --version | head -1)"
+  ENV_FILE="${SUDO_HOME}/.env"
 fi
 
-# --- 3. Node 20 LTS ---
-echo "[3/10] Installing Node ${NODE_VERSION} LTS..."
-if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | cut -d. -f1 | tr -d v)" -lt "${NODE_VERSION}" ]]; then
-  curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash -
-  apt-get install -y -qq nodejs
-else
-  echo "Node already installed: $(node -v)"
-fi
+DOMAIN="${DOMAIN:-vscode.dmj.one}"
+CODE_SERVER_PORT="${CODE_SERVER_PORT:-8080}"
+CONTAINER_NAME="${CONTAINER_NAME:-vscode-web}"
+IMAGE="vscode-web:local"
+echo "Domain=${DOMAIN}  Container=${CONTAINER_NAME}  Port=${CODE_SERVER_PORT}"
 
-# --- 4. Claude Code CLI ---
-echo "[4/10] Installing Claude Code CLI..."
-if ! command -v claude >/dev/null 2>&1; then
-  npm install -g @anthropic-ai/claude-code
-else
-  echo "claude already installed: $(claude --version 2>/dev/null || echo present)"
+# --- detect front door ---
+MODE="standalone"
+CADDY_CONTAINER="${CADDY_CONTAINER:-}"
+if command -v docker >/dev/null 2>&1; then
+  [[ -z "${CADDY_CONTAINER}" ]] && CADDY_CONTAINER="$(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null | awk -F'|' '/:443->/{print $1; exit}')"
+  [[ -n "${CADDY_CONTAINER}" ]] && docker inspect "${CADDY_CONTAINER}" >/dev/null 2>&1 && MODE="integrate"
 fi
-# Also install a few global tools that help agent workflows
-npm install -g pnpm typescript tsx 2>/dev/null || true
+echo "Front-door mode: ${MODE}${CADDY_CONTAINER:+ (container=${CADDY_CONTAINER})}"
 
-# --- 5. Password handling (Argon2id) ---
-echo "[5/10] Handling password (Argon2id)..."
+# --- password (generate + persist once) ---
 if [[ -z "${CODE_SERVER_PASSWORD:-}" ]]; then
-  echo "CODE_SERVER_PASSWORD not set. Generating a strong random password." >&2
+  command -v openssl >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq openssl >/dev/null; }
   CODE_SERVER_PASSWORD="$(openssl rand -base64 24)"
-  echo "" >&2
-  echo "==========================================================" >&2
-  echo "GENERATED PASSWORD (save this now, it is NOT stored plaintext):" >&2
-  echo "  ${CODE_SERVER_PASSWORD}" >&2
-  echo "==========================================================" >&2
-  echo "" >&2
-  # Persist to .env so the user can recover it once, then they should rotate.
-  echo "CODE_SERVER_PASSWORD=${CODE_SERVER_PASSWORD}" >> "${ENV_FILE}"
+  echo "  Generated password (saved once to ${ENV_FILE}):"
+  echo "      ${CODE_SERVER_PASSWORD}"
+  touch "${ENV_FILE}"; chmod 600 "${ENV_FILE}"
+  grep -q '^CODE_SERVER_PASSWORD=' "${ENV_FILE}" 2>/dev/null || echo "CODE_SERVER_PASSWORD=${CODE_SERVER_PASSWORD}" >> "${ENV_FILE}"
 fi
-# code-server accepts a plaintext password in config; it hashes it internally.
-# We store the Argon2id hash in a separate file for audit, but code-server uses plaintext
-# from config (code-server does its own bcrypt). We keep the plaintext only in the
-# root-readable config file (mode 600).
-PASSWORD_HASH="$(echo -n "${CODE_SERVER_PASSWORD}" | argon2 "$(openssl rand -base64 16)" -id -t 3 -m 16 -p 1 -l 32 2>/dev/null || echo 'hash-unavailable')"
-echo "Password Argon2id hash: ${PASSWORD_HASH:0:40}... (full hash in /etc/code-server/.pw-hash)"
 
-# --- 6. code-server systemd service ---
-echo "[6/10] Configuring code-server systemd service..."
-mkdir -p "${CODE_SERVER_DATA}"
-chown -R "${CODE_SERVER_USER}":"${CODE_SERVER_USER}" "${CODE_SERVER_DATA}" 2>/dev/null || true
+site_check() { curl -sk -o /dev/null -w '%{http_code}' --resolve "$1:443:127.0.0.1" --max-time 8 "https://$1/" 2>/dev/null || echo 000; }
 
-# code-server config (YAML). Bind to localhost only; Nginx fronts it.
-CS_CONFIG_DIR="${CODE_SERVER_HOME}/.config/code-server"
-mkdir -p "${CS_CONFIG_DIR}"
-chown -R "${CODE_SERVER_USER}":"${CODE_SERVER_USER}" "${CS_CONFIG_DIR}" 2>/dev/null || true
-cat > "${CS_CONFIG_DIR}/config.yaml" <<EOF
+# =====================================================================
+if [[ "${MODE}" == "integrate" ]]; then
+  # ---- remove any earlier host-native code-server from a prior run ----
+  if systemctl list-unit-files 2>/dev/null | grep -q '^code-server.service'; then
+    echo "Removing prior host-native code-server service (superseded by container)..."
+    systemctl disable --now code-server 2>/dev/null || true
+    rm -f /etc/systemd/system/code-server.service
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+
+  # ---- the docker network Caddy lives on (join it so Caddy resolves us) ----
+  if [[ -z "${FRONT_NET:-}" ]]; then
+    FRONT_NET="$(docker inspect "${CADDY_CONTAINER}" --format '{{range $n,$v := .NetworkSettings.Networks}}{{$n}} {{end}}' | awk '{print $1}')"
+  fi
+  [[ -n "${FRONT_NET}" ]] || { echo "ERROR: could not determine ${CADDY_CONTAINER}'s network." >&2; exit 1; }
+  echo "[1/4] code-server will join docker network: ${FRONT_NET}"
+
+  # ---- build the image (code-server + Node 20 + Claude Code), only if missing ----
+  echo "[2/4] Ensuring image ${IMAGE} (code-server + Node 20 + Claude Code)..."
+  if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+    BUILD_DIR="$(mktemp -d)"
+    cat > "${BUILD_DIR}/Dockerfile" <<'DOCKER'
+# Pinned for reproducible rebuilds. Bump deliberately; codercom/code-server
+# publishes a semver tag per release and is multi-arch (arm64 for A1, x86_64 for E5).
+FROM codercom/code-server:4.130.0
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl git jq ca-certificates build-essential python3 \
+ && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && npm install -g @anthropic-ai/claude-code pnpm \
+ && rm -rf /var/lib/apt/lists/*
+USER coder
+DOCKER
+    docker build -t "${IMAGE}" "${BUILD_DIR}"
+    rm -rf "${BUILD_DIR}"
+  else
+    echo "  image present."
+  fi
+
+  # ---- (re)create the container on the front-door network, no host port ----
+  echo "[3/4] Starting container ${CONTAINER_NAME} on ${FRONT_NET}..."
+  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  RUN_ENV=(-e "PASSWORD=${CODE_SERVER_PASSWORD}")
+  [[ -n "${NVIDIA_API_KEY:-}" ]]          && RUN_ENV+=(-e "NVIDIA_API_KEY=${NVIDIA_API_KEY}")
+  [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] && RUN_ENV+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}")
+  docker run -d --name "${CONTAINER_NAME}" \
+    --restart unless-stopped \
+    --network "${FRONT_NET}" \
+    "${RUN_ENV[@]}" \
+    -v vscode-web-home:/home/coder \
+    "${IMAGE}" >/dev/null
+
+  # ---- wait until Caddy can actually reach it by name ----
+  echo "  waiting for ${CONTAINER_NAME}:${CODE_SERVER_PORT} from Caddy..."
+  CS_UP=""
+  for i in $(seq 1 30); do
+    if docker exec "${CADDY_CONTAINER}" sh -c "wget -q -T3 -O- http://${CONTAINER_NAME}:${CODE_SERVER_PORT}/healthz >/dev/null 2>&1 || wget -q -T3 -O- http://${CONTAINER_NAME}:${CODE_SERVER_PORT}/ >/dev/null 2>&1"; then
+      CS_UP=1; echo "  reachable."; break
+    fi
+    sleep 2
+  done
+  [[ -z "${CS_UP}" ]] && { echo "ERROR: Caddy cannot reach ${CONTAINER_NAME}; front door untouched." >&2; docker logs --tail 30 "${CONTAINER_NAME}" || true; exit 1; }
+
+  # ---- append the Caddy site (backup, strip old managed block, validate, reload) ----
+  echo "[4/4] Adding the ${DOMAIN} site to Caddy (${CADDY_CONTAINER})..."
+  [[ -z "${CADDYFILE_PATH:-}" ]] && CADDYFILE_PATH="$(docker inspect "${CADDY_CONTAINER}" --format '{{range .Mounts}}{{if eq .Destination "/etc/caddy/Caddyfile"}}{{.Source}}{{end}}{{end}}')"
+  [[ -f "${CADDYFILE_PATH}" ]] || { echo "ERROR: mounted Caddyfile not found (${CADDYFILE_PATH:-unset})." >&2; exit 1; }
+  echo "  Caddyfile: ${CADDYFILE_PATH}"
+
+  mapfile -t PRE_HOSTS < <(sed '/>>> vscode-web managed:/,/<<< vscode-web managed:/d' "${CADDYFILE_PATH}" \
+    | grep -oE 'https?://[A-Za-z0-9][A-Za-z0-9.-]+\.[A-Za-z]{2,}' | sed -E 's#https?://##' | sort -u | grep -vx "${DOMAIN}" || true)
+  declare -A PRE_CODE
+  echo "  baseline of existing sites:"
+  for h in "${PRE_HOSTS[@]}"; do PRE_CODE["$h"]="$(site_check "$h")"; echo "    ${h} -> ${PRE_CODE[$h]}"; done
+
+  BACKUP="${CADDYFILE_PATH}.bak.vscode-web.${TS}"
+  cp -a "${CADDYFILE_PATH}" "${BACKUP}"; echo "  backup: ${BACKUP}"
+  # A single-file docker bind mount follows the INODE. `sed -i` / `mv` swap the
+  # inode and silently desync the running Caddy from the file on disk, so we
+  # build the new content in a temp file and truncate-rewrite the SAME inode
+  # (cat > file). And because the live mount may ALREADY be stale, we validate
+  # and reload Caddy from a copy pushed into the container, not the mounted path.
+  NEWCF="$(mktemp)"
+  sed '/>>> vscode-web managed:/,/<<< vscode-web managed:/d' "${CADDYFILE_PATH}" > "${NEWCF}"
+  cat >> "${NEWCF}" <<EOF
+
+# >>> vscode-web managed: ${DOMAIN} >>>
+# Added by vscode-web/deploy/autoconfig.sh. Mirrors the box's other proxied
+# containers: reach code-server by container name on the shared docker network,
+# tls internal (Cloudflare Full mode). Remove this block to detach the site.
+(vscode_web_site) {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options    "nosniff"
+		X-Frame-Options           "SAMEORIGIN"
+		Referrer-Policy           "strict-origin-when-cross-origin"
+		-Server
+	}
+	reverse_proxy ${CONTAINER_NAME}:${CODE_SERVER_PORT} {
+		header_up -CF-Connecting-IP
+	}
+}
+
+http://${DOMAIN} {
+	import vscode_web_site
+}
+
+https://${DOMAIN} {
+	tls internal
+	import vscode_web_site
+}
+# <<< vscode-web managed: ${DOMAIN} <<<
+EOF
+  cat "${NEWCF}" > "${CADDYFILE_PATH}"; rm -f "${NEWCF}"   # write back in place (same inode)
+
+  # Validate + reload from a copy pushed into the container, so a stale single-
+  # file bind mount can never desync the running Caddy from what we just wrote.
+  cf_reload() {
+    docker cp "${CADDYFILE_PATH}" "${CADDY_CONTAINER}:/tmp/vscode-web-caddyfile" >/dev/null 2>&1
+    docker exec "${CADDY_CONTAINER}" caddy "$1" --config /tmp/vscode-web-caddyfile --adapter caddyfile
+  }
+  if ! cf_reload validate >/tmp/vscode-web-validate.log 2>&1; then
+    echo "ERROR: caddy validate FAILED. Restoring Caddyfile (no reload happened)." >&2
+    cat /tmp/vscode-web-validate.log >&2; cat "${BACKUP}" > "${CADDYFILE_PATH}"; exit 1
+  fi
+  echo "  validate OK. Reloading Caddy (graceful)..."
+  cf_reload reload
+
+  echo "  re-checking existing sites:"
+  REGRESSED=""
+  for h in "${PRE_HOSTS[@]}"; do
+    now="$(site_check "$h")"; echo "    ${h}: ${PRE_CODE[$h]} -> ${now}"
+    # regression = was healthy (2xx/3xx), now is not.
+    [[ "${PRE_CODE[$h]}" =~ ^[23] && ! "${now}" =~ ^[23] ]] && REGRESSED="${REGRESSED} ${h}"
+  done
+  if [[ -n "${REGRESSED}" ]]; then
+    echo "ERROR: regression on:${REGRESSED}, rolling back Caddyfile + reload." >&2
+    cat "${BACKUP}" > "${CADDYFILE_PATH}"; cf_reload reload || true
+    exit 1
+  fi
+  NEW_CODE="$(site_check "${DOMAIN}")"; echo "  ${DOMAIN} via Caddy -> HTTP ${NEW_CODE}"
+
+# =====================================================================
+else
+  # ---- standalone: host-native code-server + native Caddy (blank VM) ----
+  CODE_SERVER_USER="${CODE_SERVER_USER:-${SUDO_USER:-ubuntu}}"
+  NODE_VERSION="${NODE_VERSION:-20}"
+  CS_HOME="$(getent passwd "${CODE_SERVER_USER}" | cut -d: -f6)"
+  export DEBIAN_FRONTEND=noninteractive
+  echo "[1/4] Installing packages (targeted)..."; apt-get update -qq
+  apt-get install -y -qq curl ca-certificates gnupg jq git openssl >/dev/null
+  echo "[2/4] Installing code-server + Node ${NODE_VERSION} + Claude Code..."
+  command -v code-server >/dev/null 2>&1 || curl -fsSL https://code-server.dev/install.sh | sh
+  if ! command -v node >/dev/null 2>&1 || [[ "$(node -v | sed 's/v//;s/\..*//')" -lt "${NODE_VERSION}" ]]; then
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash -; apt-get install -y -qq nodejs >/dev/null
+  fi
+  command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code
+  install -d -m 700 -o "${CODE_SERVER_USER}" -g "${CODE_SERVER_USER}" "${CS_HOME}/.config/code-server"
+  cat > "${CS_HOME}/.config/code-server/config.yaml" <<EOF
 bind-addr: 127.0.0.1:${CODE_SERVER_PORT}
 auth: password
 password: ${CODE_SERVER_PASSWORD}
 cert: false
-user-data-dir: ${CODE_SERVER_DATA}/user
-extensions-dir: ${CODE_SERVER_DATA}/extensions
-disable-telemetry: true
-disable-update-check: true
 EOF
-chmod 600 "${CS_CONFIG_DIR}/config.yaml"
-chown "${CODE_SERVER_USER}":"${CODE_SERVER_USER}" "${CS_CONFIG_DIR}/config.yaml" 2>/dev/null || true
-
-# Store the audit hash
-mkdir -p /etc/code-server
-echo "${PASSWORD_HASH}" > /etc/code-server/.pw-hash
-chmod 600 /etc/code-server/.pw-hash
-
-# systemd unit
-cat > /etc/systemd/system/code-server.service <<EOF
+  chmod 600 "${CS_HOME}/.config/code-server/config.yaml"; chown "${CODE_SERVER_USER}:${CODE_SERVER_USER}" "${CS_HOME}/.config/code-server/config.yaml"
+  cat > /etc/systemd/system/code-server.service <<EOF
 [Unit]
 Description=code-server (VS Code in the browser)
-After=network.target
-
+After=network-online.target
+Wants=network-online.target
 [Service]
-Type=simple
 User=${CODE_SERVER_USER}
-Group=${CODE_SERVER_USER}
-WorkingDirectory=${CODE_SERVER_HOME}
+WorkingDirectory=${CS_HOME}
 Environment=NODE_OPTIONS=--max-old-space-size=4096
 EnvironmentFile=-${ENV_FILE}
-ExecStart=/usr/bin/code-server --config ${CS_CONFIG_DIR}/config.yaml
+ExecStart=/usr/bin/code-server --config ${CS_HOME}/.config/code-server/config.yaml
 Restart=always
-RestartSec=5
-# Hardening
-NoNewPrivileges=true
-ProtectSystem=full
-ProtectHome=read-only
-PrivateTmp=true
-
+RestartSec=3
+LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-
-systemctl daemon-reload
-systemctl enable --now code-server
-systemctl restart code-server
-
-# --- 7. Nginx reverse proxy with TLS ---
-echo "[7/10] Configuring Nginx reverse proxy (443 -> 127.0.0.1:${CODE_SERVER_PORT})..."
-# Self-signed cert for direct-IP access; Cloudflare proxy uses its own edge cert.
-CERT_DIR="/etc/nginx/ssl"
-mkdir -p "${CERT_DIR}"
-if [[ ! -f "${CERT_DIR}/selfsigned.crt" ]]; then
-  openssl req -x509 -nodes -days 3650 \
-    -newkey rsa:2048 \
-    -keyout "${CERT_DIR}/selfsigned.key" \
-    -out "${CERT_DIR}/selfsigned.crt" \
-    -subj "/CN=${DOMAIN}" -addext "subjectAltName=DNS:${DOMAIN},IP:$(hostname -I | awk '{print $1}')" >/dev/null 2>&1
-fi
-chmod 600 "${CERT_DIR}/selfsigned.key"
-
-cat > /etc/nginx/sites-available/code-server <<'EOF'
-server {
-    listen 80;
-    server_name _;
-    # Redirect all HTTP to HTTPS
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name DOMAIN_PLACEHOLDER;
-
-    ssl_certificate     /etc/nginx/ssl/selfsigned.crt;
-    ssl_certificate_key /etc/nginx/ssl/selfsigned.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-
-    # Security headers
-    add_header X-Content-Type-Options nosniff always;
-    add_header X-Frame-Options SAMEORIGIN always;
-    add_header Referrer-Policy strict-origin-when-cross-origin always;
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-
-    # code-server needs large bodies for file uploads + websocket upgrade
-    client_max_body_size 100m;
-
-    location / {
-        proxy_pass http://127.0.0.1:CS_PORT_PLACEHOLDER;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        # WebSocket support (code-server uses WS heavily)
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        # Long-running agent operations
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-        proxy_buffering off;
-    }
-
-    # Health endpoint (shallow)
-    location = /health {
-        access_log off;
-        return 200 '{"status":"ok"}';
-        add_header Content-Type application/json;
-    }
-}
-EOF
-# Substitute placeholders
-sed -i "s/DOMAIN_PLACEHOLDER/${DOMAIN}/g" /etc/nginx/sites-available/code-server
-sed -i "s/CS_PORT_PLACEHOLDER/${CODE_SERVER_PORT}/g" /etc/nginx/sites-available/code-server
-ln -sf /etc/nginx/sites-available/code-server /etc/nginx/sites-enabled/code-server
-rm -f /etc/nginx/sites-enabled/default
-nginx -t
-systemctl enable --now nginx
-systemctl restart nginx
-
-# --- 8. UFW firewall ---
-echo "[8/10] Configuring UFW (22, 80, 443 only)..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp comment 'SSH'
-ufw allow 80/tcp comment 'HTTP'
-ufw allow 443/tcp comment 'HTTPS'
-ufw --force enable
-
-# --- 9. fail2ban (SSH brute-force) ---
-echo "[9/10] Configuring fail2ban..."
-cat > /etc/fail2ban/jail.local <<'EOF'
-[sshd]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 5
-bantime = 3600
-findtime = 600
-EOF
-systemctl enable --now fail2ban
-systemctl restart fail2ban
-
-# --- 10. Health check ---
-echo "[10/10] Verifying health..."
-sleep 3
-for i in 1 2 3 4 5; do
-  if curl -fsS -o /dev/null -w "%{http_code}" http://127.0.0.1:${CODE_SERVER_PORT}/health 2>/dev/null | grep -q 200; then
-    echo "code-server health: OK"
-    break
+  systemctl daemon-reload; systemctl enable code-server >/dev/null 2>&1 || true; systemctl restart code-server
+  echo "[3/4] Installing standalone Caddy for ${DOMAIN}..."
+  if ! command -v caddy >/dev/null 2>&1; then
+    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https >/dev/null
+    curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -qq && apt-get install -y -qq caddy >/dev/null
   fi
-  echo "  waiting for code-server (attempt ${i}/5)..."
-  sleep 2
-done
-# Nginx health (will 301 to https, that's fine)
-HTTP_CODE="$(curl -fsS -o /dev/null -w "%{http_code}" -k https://127.0.0.1/health 2>/dev/null || echo 'fail')"
-echo "Nginx /health: ${HTTP_CODE}"
-
-# Write NVIDIA key into the code-server user's environment if provided
-if [[ -n "${NVIDIA_API_KEY:-}" ]]; then
-  echo "NVIDIA_API_KEY is set; writing to ${CODE_SERVER_HOME}/.bashrc for code-server user."
-  grep -qxF "export NVIDIA_API_KEY=\"${NVIDIA_API_KEY}\"" "${CODE_SERVER_HOME}/.bashrc" 2>/dev/null \
-    || echo "export NVIDIA_API_KEY=\"${NVIDIA_API_KEY}\"" >> "${CODE_SERVER_HOME}/.bashrc"
-  chown "${CODE_SERVER_USER}":"${CODE_SERVER_USER}" "${CODE_SERVER_HOME}/.bashrc" 2>/dev/null || true
+  cat > /etc/caddy/Caddyfile <<EOF
+${DOMAIN} {
+	tls internal
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+	reverse_proxy 127.0.0.1:${CODE_SERVER_PORT}
+}
+EOF
+  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+  systemctl enable caddy >/dev/null 2>&1 || true; systemctl reload caddy 2>/dev/null || systemctl restart caddy
+  echo "[4/4] done."; NEW_CODE="$(site_check "${DOMAIN}")"; echo "  ${DOMAIN} -> HTTP ${NEW_CODE}"
 fi
-# Claude Code OAuth token
-if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
-  echo "CLAUDE_CODE_OAUTH_TOKEN is set; configuring claude CLI auth."
-  sudo -u "${CODE_SERVER_USER}" bash -c "claude config set oauthToken '${CLAUDE_CODE_OAUTH_TOKEN}' 2>/dev/null" || true
-fi
 
+# --- summary ---
+PUB_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')"
 echo ""
 echo "============================================================"
-echo "autoconfig.sh COMPLETE at $(date)"
-echo "  code-server : https://${DOMAIN}  (or https://$(hostname -I | awk '{print $1}'))"
-echo "  Internal    : 127.0.0.1:${CODE_SERVER_PORT}"
-echo "  User        : ${CODE_SERVER_USER}"
-echo "  Log         : ${LOG_FILE}"
+echo " code-server is live behind ${DOMAIN}  (mode: ${MODE})"
+echo " log: ${LOG_FILE}"
 echo "============================================================"
-echo "NEXT: Add Cloudflare DNS A record -> $(hostname -I | awk '{print $1}') for ${DOMAIN}"
-echo "      (Proxy ON so Cloudflare terminates TLS with a real cert)"
+echo " NEXT: add the Cloudflare DNS record (you do this, manually):"
+echo "     A   ${DOMAIN%%.*}   ${PUB_IP}   Proxy ON (orange)   SSL/TLS: Full"
+echo " Then open https://${DOMAIN} and log in with CODE_SERVER_PASSWORD."
+echo "============================================================"

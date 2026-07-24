@@ -1,125 +1,149 @@
-# vscode-web — VS Code in the browser on a GCloud VM
+# vscode-web: VS Code in any browser, on an always-on VM
 
-Run VS Code in your browser on an always-on GCloud VM. Code from your phone, tablet, or any browser. Switch off your laptop; the VM keeps coding. Preconfigured for **10+ parallel Claude Code agents** and **NVIDIA build.nvidia.com models** (GLM 5.2, Nemotron, Kimi K2, DeepSeek, etc.).
+Close the laptop. The agents keep coding. vscode-web puts full VS Code in your browser on an always-on Oracle Cloud VM, ready for 10+ parallel Claude Code agents and NVIDIA build.nvidia.com models. Open it from a phone, a tablet, or a borrowed machine. The work does not stop because your hardware went to sleep.
+
+Live now at https://vscode.dmj.one (code-server answers with its login redirect, HTTP 302, through the existing Caddy front door).
 
 ## Why
 
-Your laptop is slow and you have to keep it on for long agent runs. A VM is always online, costs less than your electricity bill, and survives you closing the lid.
+Long agent runs need a machine that stays on. Your laptop does not, and you should not have to babysit it. A small always-on VM survives every lid close, reboot, and commute. On OCI's Always-Free tier it costs nothing.
 
 ## Architecture
 
+One front door owns :80 and :443. `autoconfig.sh` detects which of two situations it is in and adapts.
+
+**integrate (primary, verified live).** The VM already runs Caddy inside Docker as the single front door for :80 and :443, serving other domains (sso.dmj.one, workday.dmj.one, testudaan.dmj.one). `autoconfig.sh` builds a small code-server image, runs it as its OWN container joined to that Caddy's docker network, and Caddy reaches it BY CONTAINER NAME. It publishes no host port, so the container is not reachable from the internet directly, and it never touches the host firewall.
+
 ```
-Browser ──HTTPS──> Cloudflare (TLS, DDoS, WAF) ──> GCloud VM (Nginx:443) ──> code-server (127.0.0.1:8080)
-                                                          │
-                                                          ├─ Claude Code CLI (10+ agents)
-                                                          ├─ Node 20 LTS
-                                                          └─ .env (NVIDIA_API_KEY, password)
+Browser --HTTPS--> Cloudflare (Full mode: real TLS, DDoS, WAF, origin IP hidden)
+                       |
+                       v
+                  OCI VM  :443
+                  Caddy (Docker, the existing front door)
+                    |-- sso.dmj.one        --> its container
+                    |-- workday.dmj.one    --> its container
+                    |-- testudaan.dmj.one  --> its container
+                    '-- vscode.dmj.one     --> vscode-web:8080   (one appended site block)
+                                                    |
+                                                    v   shared docker network, no published host port
+                                   vscode-web container: code-server
+                                     |-- Claude Code CLI (10+ parallel agents)
+                                     |-- Node 20 LTS + pnpm
+                                     '-- NVIDIA_API_KEY in the shell
+                                   volume vscode-web-home -> /home/coder  (persists restarts)
 ```
 
-- **code-server** (VS Code in the browser) behind Nginx with password auth
-- **Argon2id** password hashing, **UFW** (22/80/443 only), **fail2ban** SSH guard
-- **Cloudflare** in front: real TLS cert, DDoS, WAF (you add the DNS record manually)
-- **Claude Code CLI** preinstalled for parallel agent workflows
-- **NVIDIA build.nvidia.com** API key wired into the code-server environment
+**standalone (greenfield, provided but not live-tested).** No front door on the box (a blank VM). `autoconfig.sh` runs code-server host-native under systemd on 127.0.0.1:8080 and installs Caddy natively to serve the domain. This path exists for convenience on a fresh VM. It has not been exercised on the author's box, so treat it as untested.
+
+TLS: Cloudflare proxies the domain in Full mode. Caddy answers with `tls internal`, a self-signed origin cert. No public ACME, no cert to renew on the box.
+
+## Why a container here, and not host-native
+
+This is the interesting engineering point, so here it is straight. The first instinct is to run code-server directly on the host and point Caddy at `127.0.0.1:8080`. On a hardened box that returns 502. Hardened hosts commonly REJECT docker-to-host traffic except for a small whitelist, seen in the wild as an `INPUT ... -j REJECT --reject-with icmp-host-prohibited` rule, so the Caddy container cannot reach a host-native upstream. A container on the same docker bridge is the only non-invasive path, and it mirrors exactly how the box already proxies its other apps.
+
+Docker was avoided elsewhere in this project to save RAM on small VMs. That tradeoff does not apply here: on a 24 GB or 32 GB box one code-server container (about 200 MB) is irrelevant, and a container is the correct tool for a hookup that must not disrupt anything already running.
+
+## Non-disruption guarantees
+
+The integrate path is built to add one site to a live front door without risking the others. In order, `autoconfig.sh`:
+
+1. Backs up the Caddyfile before editing it.
+2. Records the current HTTP status of every existing site as a baseline.
+3. Appends exactly ONE site block for `vscode.dmj.one`.
+4. Runs `caddy validate`. On failure it restores the backup and stops, no reload happens.
+5. Reloads Caddy gracefully from a COPY of the config pushed into the container. A single-file docker bind mount follows the inode, so editing the host file can leave the running Caddy reading stale content. Validating and reloading from an in-container copy sidesteps that.
+6. Re-checks every baseline site. If any previously-healthy site regressed, it rolls the Caddyfile back and reloads, then stops.
+
+Verified across deploys: sso.dmj.one, workday.dmj.one, and testudaan.dmj.one were unchanged.
+
+## Persistence
+
+A named docker volume, `vscode-web-home`, holds `/home/coder`: your workspace, installed extensions, editor config, and the `claude` login. Restart or rebuild the container and all of it is still there.
 
 ## Cost
 
-| VM | RAM | 24/7 | Stopped when idle |
-|---|---|---|---|
-| e2-standard-2 (default) | 8 GB | ~$25/mo | ~$7/mo |
-| e2-standard-4 | 16 GB | ~$50/mo | ~$14/mo |
+| Shape | vCPU | RAM | Arch | Always-Free | Monthly cost |
+|---|---|---|---|---|---|
+| Ampere A1.Flex (recommended) | up to 4 OCPU | 24 GB | arm64 | Yes | $0 |
+| E5.Flex (this author's box) | 6 OCPU | 32 GB | x86_64 | No | paid, OCI on-demand pricing |
 
-**Stop the VM when you're not coding** to cut cost ~75% (you only pay for the disk while stopped):
+The free A1 is the zero-cost target and runs everything here. The E5 shape is not always-free; it bills per OCI on-demand pricing whenever it runs. The code-server base image is multi-arch and NodeSource ships arm64, so the inline build works on A1 (arm64) and E5 (x86_64) with no changes.
+
+## Deploy in 2 steps
+
+Prerequisite: an OCI VM you can SSH into, already fronted by a Caddy-in-Docker instance on :443 (the integrate case). To start from a blank VM, create an Always-Free Ampere A1.Flex (up to 4 OCPU / 24 GB) in the OCI Console, allow ingress on 80 and 443 in its security list, and note the public IP.
+
+### 1. Copy the script and a filled `.env` to the VM
 ```bash
-gcloud compute instances stop code-server --zone=us-central1-a
-gcloud compute instances start code-server --zone=us-central1-a
+scp deploy/autoconfig.sh .env  user@vm:~
 ```
-Note: the external IP may change on stop/start. Reserve a static IP if you want it stable (see `deploy/create-vm.sh` output).
+Fill `.env` from `.env.example`. Leave `CODE_SERVER_PASSWORD` blank to have autoconfig generate one, print it once, and save it back to `~/.env`.
 
-## Deploy in 4 steps
-
-### 1. Provision the VM
+### 2. Run autoconfig
 ```bash
-./deploy/create-vm.sh
+sudo bash autoconfig.sh
 ```
-Creates an e2-standard-2 VM in us-central1-a, opens firewall 80/443, prints the external IP.
+It auto-detects the front door. If a Caddy container owns :443 it builds the code-server image, starts the `vscode-web` container on that Caddy's network, and integrates one site block (validate, graceful reload, auto-rollback if any existing site regresses). If nothing fronts :443 it falls back to standalone. Idempotent: rerun to rotate the password or pick up a changed `.env`.
 
-### 2. Create `.env` and copy it to the VM
-```bash
-cp .env.example .env
-# edit .env: set CODE_SERVER_PASSWORD (or leave blank to auto-generate), NVIDIA_API_KEY, etc.
-
-VM=code-server
-ZONE=us-central1-a
-gcloud compute scp deploy/autoconfig.sh .env ${VM}:~/ --zone=${ZONE}
+### One manual step: the Cloudflare DNS record
+`autoconfig.sh` cannot edit Cloudflare DNS, so it prints the exact record for you to add:
 ```
-
-### 3. SSH in and bootstrap
-```bash
-gcloud compute ssh ${VM} --zone=${ZONE}
-sudo bash ~/autoconfig.sh
+Type          A
+Name          vscode
+Value         <VM public IP>
+Proxy         ON (orange cloud)
+SSL/TLS mode  Full
 ```
-Idempotent. Installs code-server, Node 20, Claude Code, Nginx, UFW, fail2ban. Binds code-server to 127.0.0.1:8080, Nginx fronts it on 443 with a self-signed cert (Cloudflare provides the real cert at the edge).
-
-### 4. Add the Cloudflare DNS record (you, manually)
-```
-Type: A
-Name: code
-Target: <EXTERNAL_IP from step 1>
-Proxy status: Proxied (orange cloud)
-```
-Wait ~60s, then open **https://code.dmj.one**. Log in with your password.
+Give it about a minute, then open https://vscode.dmj.one and log in with `CODE_SERVER_PASSWORD`.
 
 ## Running 10+ parallel Claude Code agents
 
-Once logged into code-server, open a terminal (Ctrl+\`) and:
+Open a terminal inside code-server (Ctrl+`) and fan out:
 ```bash
-claude                    # first run: `claude login` to auth
-# then in multiple terminals / splits, fire agents in parallel:
+claude                      # first run: authenticate once (persisted in the volume)
+# then, across terminals or splits, fire agents in parallel:
 claude --print "implement feature A" &
 claude --print "implement feature B" &
 claude --print "implement feature C" &
 wait
 ```
-e2-standard-2 (8 GB) handles ~10 concurrent agents. For 15+, bump to e2-standard-4.
+24 GB (free A1) or 32 GB (the author's box) runs 10+ concurrent agents comfortably. Agents are network-bound: they spend most of their time waiting on API calls, not CPU, so a modest VM keeps up. If you set `CLAUDE_CODE_OAUTH_TOKEN` in `.env`, the CLI is pre-authenticated and you can skip the first `claude login`.
 
 ## NVIDIA build.nvidia.com models
 
-Your `NVIDIA_API_KEY` is exported in the code-server shell. Use it from any script:
+`autoconfig.sh` passes `NVIDIA_API_KEY` into the container environment. Call any model from a terminal or a script:
 ```bash
 curl -s https://integrate.api.nvidia.com/v1/chat/completions \
   -H "Authorization: Bearer $NVIDIA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-ai/deepseek-r1","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ```
-Or wire it into a code-server extension / MCP server for in-editor model switching.
+Swap the model id for GLM, Nemotron, Kimi K2, DeepSeek, or anything else in the build.nvidia.com catalog.
 
 ## Files
 
 ```
 deploy/
-  create-vm.sh        # gcloud VM provisioning (idempotent)
-  autoconfig.sh       # VM bootstrap: blank Ubuntu -> code-server on 443 (idempotent)
-  Dockerfile          # code-server + Node + Claude Code (for local parity)
-  docker-compose.yml  # local dev
-.env.example          # all config; copy to .env
+  autoconfig.sh   # the only deploy artifact. Detects the Caddy front door and
+                  # integrates one site block (build image, run container on the
+                  # front-door network, validate, graceful reload, auto-rollback),
+                  # or falls back to standalone. Idempotent, safe to rerun.
+.env.example      # all config; copy to .env on the VM
+.gitignore
+idea.md           # the original problem statement
+README.md
+CHANGELOG.md
 ```
+
+The container image (code-server + Node 20 + Claude Code CLI + pnpm) is built inline by `autoconfig.sh`. There is no separate Dockerfile or compose file in the repo.
 
 ## Security
 
-- Password auth on code-server (Argon2id hashed audit copy)
-- UFW: only 22/80/443 open
-- fail2ban: SSH brute-force protection (5 fails -> 1h ban)
-- Cloudflare proxy: real TLS, DDoS, WAF, hides origin IP
-- Secrets in `.env` (mode 600), never in source
-- code-server bound to 127.0.0.1 only; never directly exposed
-
-## Teardown
-
-```bash
-gcloud compute instances delete code-server --zone=us-central1-a
-gcloud compute firewall-rules delete allow-http-https
-```
+- Password auth on code-server. It verifies the login; the password lives only in `.env`, written mode 600.
+- Not exposed to the internet. In integrate mode the container publishes no host port, so only Caddy on the shared docker network can reach it. Cloudflare in Full mode hides the origin IP and provides real TLS, DDoS absorption, and WAF at the edge.
+- Caddy sets HSTS, X-Content-Type-Options, X-Frame-Options, and Referrer-Policy on every response, and strips the Server header.
+- Secrets live only in `.env`, mode 600, never in source.
+- The host firewall is never modified. `autoconfig.sh` does not touch UFW, iptables, or fail2ban. Manage those at the OS or OCI security-list layer so a redeploy cannot disrupt the box.
 
 ## License
 
