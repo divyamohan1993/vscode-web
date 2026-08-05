@@ -1,0 +1,13 @@
+{
+  "//": "Portable MCP servers. The same block works in Claude, Cline, Continue, and Copilot (MCP). Register it in each agent so they all share these tools. No secrets here; servers that need a key read it from the environment.",
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    }
+  }
+}

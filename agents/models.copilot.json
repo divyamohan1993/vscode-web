@@ -1,0 +1,81 @@
+[
+  {
+    "name": "nvidia",
+    "vendor": "customendpoint",
+    "apiKey": "${input:chat.lm.secret.-289f7296}",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "z-ai/glm-5.2",
+        "name": "GLM-5.2 (coding · 1M)",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 131072
+      },
+      {
+        "id": "deepseek-ai/deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro via NVIDIA (long-context · 1M)",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 32768
+      },
+      {
+        "id": "moonshotai/kimi-k2.6",
+        "name": "Kimi K2.6 (vision · agentic)",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 262144,
+        "maxOutputTokens": 32768
+      },
+      {
+        "id": "nvidia/nemotron-3-ultra-550b-a55b",
+        "name": "Nemotron 3 Ultra 550B (reasoning · 1M)",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 32768
+      },
+      {
+        "id": "moonshotai/kimi-k3",
+        "name": "Kimi K3 (frontier · 1M)",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 32768
+      }
+    ]
+  },
+  {
+    "name": "deepseek",
+    "vendor": "customendpoint",
+    "apiKey": "${input:chat.lm.secret.deepseek}",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "deepseek-v4-flash",
+        "name": "DeepSeek V4 Flash 0731 (fast · 1M)",
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 393216
+      },
+      {
+        "id": "deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro (direct · 1M)",
+        "url": "https://api.deepseek.com/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 393216
+      }
+    ]
+  }
+]

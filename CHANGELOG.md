@@ -5,6 +5,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### 2026-08-05 - Multi-agent brain: one instruction set for any AI agent
+
+**Added**
+- `agents/`: makes the dmj conventions, tools, and models work in agents other than Claude Code (GitHub Copilot, Continue, Cline / Roo, Cursor), so the server can be driven by NVIDIA or DeepSeek models with the same discipline.
+- `agents/AGENTS.md`: canonical cross-agent instruction set distilled from CLAUDE.md and the dmj skills (private financial details excluded; it is a public file). `setup-agents.sh` symlinks each agent's own instruction file to it, so one edit updates all.
+- `agents/models.copilot.json`: VS Code Copilot custom OpenAI-compatible providers for NVIDIA (`integrate.api.nvidia.com`) and DeepSeek direct (`api.deepseek.com`: `deepseek-v4-flash` / V4-Flash-0731 and `deepseek-v4-pro`). Keys are `${input:...}` secret references, never committed.
+- `agents/mcp.json`: portable MCP servers (context7, playwright) that carry across Claude, Cline, Continue, and Copilot.
+
 ### 2026-08-05 - Cloudflare Flexible support + self-healing Caddy site
 
 **Fixed**

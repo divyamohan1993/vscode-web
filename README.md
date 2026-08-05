@@ -158,6 +158,9 @@ deploy/
   vscode-web-ensure.sh    # self-healer: re-adds the Caddy site if the box's
                           # other deploys rewrite the shared Caddyfile. Installs
                           # as a systemd path+timer via --install.
+agents/                   # make Copilot / Continue / Cline share the dmj brain (AGENTS.md),
+                          # the same MCP servers, and the NVIDIA + DeepSeek models. No Claude
+                          # required; see agents/README.md.
 .env.example              # all config; copy to .env (gitignored)
 .gitattributes            # keep *.sh LF so scripts run on Linux
 idea.md                   # the original problem statement
