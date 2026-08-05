@@ -38,7 +38,7 @@ trap 'rm -f "${BUNDLE}"' EXIT
 
 # 2. Ship scripts + bundle, and write a minimal server-side .env for autoconfig.
 echo "-- uploading scripts + config bundle --"
-"${SCP[@]}" "${HERE}/deploy/autoconfig.sh" "${HERE}/deploy/replicate-claude-env.sh" "${BUNDLE}" "${TARGET}:/tmp/" >/dev/null
+"${SCP[@]}" "${HERE}/deploy/autoconfig.sh" "${HERE}/deploy/replicate-claude-env.sh" "${HERE}/deploy/vscode-web-ensure.sh" "${BUNDLE}" "${TARGET}:/tmp/" >/dev/null
 "${SSH[@]}" "${TARGET}" "umask 077; { echo DOMAIN=${DOMAIN}; echo CODE_SERVER_PORT=8080; echo CONTAINER_NAME=${CONTAINER_NAME}; ${NVIDIA_API_KEY:+echo NVIDIA_API_KEY=${NVIDIA_API_KEY};} } > ~/.env; cp /tmp/autoconfig.sh ~/vscode-web-autoconfig.sh"
 
 # 3. Deploy code-server (auto-detects front door + network + port, non-disruptive).
@@ -49,9 +49,14 @@ echo "-- running autoconfig on the VM --"
 echo "-- replicating Claude setup into the container --"
 "${SSH[@]}" "${TARGET}" "docker cp ${BUNDLE_REMOTE} ${CONTAINER_NAME}:/tmp/claude-bundle.tgz && docker cp /tmp/replicate-claude-env.sh ${CONTAINER_NAME}:/tmp/replicate-claude-env.sh && docker exec ${CONTAINER_NAME} bash /tmp/replicate-claude-env.sh"
 
+# 4.5. Install the self-healer so the site survives other tooling on the box
+#      rewriting the shared Caddyfile (some hosts regenerate it on every deploy).
+echo "-- installing the Caddy site self-healer --"
+"${SSH[@]}" "${TARGET}" "sudo bash /tmp/vscode-web-ensure.sh --install ${DOMAIN} ${CONTAINER_NAME}:8080"
+
 # 5. Wipe the transferred secrets from the VM and container.
 echo "-- cleaning up transferred secrets --"
-"${SSH[@]}" "${TARGET}" "sudo rm -f ${BUNDLE_REMOTE} /tmp/replicate-claude-env.sh; docker exec ${CONTAINER_NAME} rm -f /tmp/claude-bundle.tgz /tmp/replicate-claude-env.sh 2>/dev/null || true"
+"${SSH[@]}" "${TARGET}" "sudo rm -f ${BUNDLE_REMOTE} /tmp/replicate-claude-env.sh /tmp/vscode-web-ensure.sh; docker exec ${CONTAINER_NAME} rm -f /tmp/claude-bundle.tgz /tmp/replicate-claude-env.sh 2>/dev/null || true"
 
 echo ""
 echo "== done =="

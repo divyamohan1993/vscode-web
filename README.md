@@ -43,7 +43,7 @@ Browser --HTTPS--> Cloudflare (Full mode: real TLS, DDoS, WAF, origin IP hidden)
 
 **standalone (greenfield, provided but not live-tested).** No front door on the box (a blank VM). `autoconfig.sh` runs code-server host-native under systemd on 127.0.0.1:8080 and installs Caddy natively to serve the domain. This path exists for convenience on a fresh VM. It has not been exercised on the author's box, so treat it as untested.
 
-TLS: Cloudflare proxies the domain in Full mode. Caddy answers with `tls internal`, a self-signed origin cert. No public ACME, no cert to renew on the box.
+TLS: Cloudflare proxies the domain. In Full mode Caddy answers with `tls internal` (a self-signed origin cert). In Flexible mode Cloudflare fetches the origin over plain http on :80, which the site serves directly, with no http-to-https redirect, so there is no loop. Either way there is no public ACME and no cert to renew on the box.
 
 ## Why a container here, and not host-native
 
@@ -67,6 +67,10 @@ Verified across deploys: sso.dmj.one, workday.dmj.one, and testudaan.dmj.one wer
 ## Persistence
 
 A named docker volume, `vscode-web-home`, holds `/home/coder`: your workspace, installed extensions, editor config, and the `claude` login. Restart or rebuild the container and all of it is still there.
+
+## Staying up
+
+The site lives as one block in a Caddyfile that the front-door owner controls. On a busy box, unrelated deploys can rewrite that file and drop any block they do not own. This is real: the site vanished once, and so did a neighbor's. So `deploy.sh` installs a small self-healer. A systemd path unit watches the Caddyfile and a timer checks every few minutes; whenever the block is missing, `vscode-web-ensure.sh` re-adds it and reloads Caddy gracefully. It is idempotent (it writes only when something is actually missing) and non-disruptive (it never touches another site). The sites it guards are listed in `/etc/vscode-web-ensure.sites`, one `domain|upstream` per line, so you can protect neighbors too.
 
 ## What lands on the server
 
@@ -151,6 +155,9 @@ deploy/
                           # standalone on a free host port. Idempotent.
   replicate-claude-env.sh # runs inside the container: config, plugins, key,
                           # and the VS Code extension. Idempotent.
+  vscode-web-ensure.sh    # self-healer: re-adds the Caddy site if the box's
+                          # other deploys rewrite the shared Caddyfile. Installs
+                          # as a systemd path+timer via --install.
 .env.example              # all config; copy to .env (gitignored)
 .gitattributes            # keep *.sh LF so scripts run on Linux
 idea.md                   # the original problem statement

@@ -5,6 +5,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### 2026-08-05 - Cloudflare Flexible support + self-healing Caddy site
+
+**Fixed**
+- Redirect loop behind Cloudflare Flexible mode. The site is served on http:// directly and never 308-redirected to https, so Cloudflare's origin fetch over :80 no longer loops. The https:// site with tls internal is kept for Full mode.
+- The site, and a neighbor (workday), had been silently dropped from the shared Caddyfile by unrelated redeploys on the box.
+
+**Added**
+- `deploy/vscode-web-ensure.sh`: idempotent self-healer that re-adds the managed site(s) to the front-door Caddyfile whenever they go missing and reloads Caddy gracefully. Auto-detects the Caddy container and its Caddyfile. `--install` sets it up as a systemd path plus timer. Guards a list of `domain|upstream` sites from `/etc/vscode-web-ensure.sites`.
+- `deploy.sh` installs the self-healer as part of every deploy, so a site stays up even on a box whose other tooling rewrites the shared Caddyfile.
+
 ### 2026-07-24 - Reusable one-command deploy + Claude environment replication
 
 **Added**
